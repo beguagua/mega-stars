@@ -1,0 +1,168 @@
+name: Build WebGL from tar.gz
+
+on:
+  workflow_dispatch:
+    inputs:
+      tar_path:
+        description: 'Caminho para o tar.gz dentro do repo ou URL HTTP(S)'
+        required: true
+        default: 'project.tar.gz'
+      unity_image:
+        description: 'Imagem Docker do Unity (tag do unityci/editor)'
+        required: false
+        default: 'unityci/editor:ubuntu-lts-2021.3'
+      build_target:
+        description: 'Build target do Unity (WebGL, Linux, Windows, Android)'
+        required: false
+        default: 'WebGL'
+
+jobs:
+  build:
+    name: Build project to WebGL
+    runs-on: ubuntu-latest
+    env:
+      TAR_PATH: ${{ github.event.inputs.tar_path }}
+      UNITY_IMAGE: ${{ github.event.inputs.unity_image }}
+      BUILD_TARGET: ${{ github.event.inputs.build_target }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure tar and curl are available
+        run: sudo apt-get update && sudo apt-get install -y tar curl
+
+      - name: Fetch or locate tar.gz
+        id: fetch_tar
+        run: |
+          echo "TAR_PATH=${TAR_PATH}"
+          if echo "${TAR_PATH}" | grep -qE '^https?://'; then
+            echo "Downloading tar from URL: ${TAR_PATH}"
+            curl -L --fail -o project.tar.gz "${TAR_PATH}"
+            TAR_FILE=project.tar.gz
+          else
+            if [ -f "${TAR_PATH}" ]; then
+              echo "Found tar at repo path: ${TAR_PATH}"
+              TAR_FILE="${TAR_PATH}"
+            else
+              echo "File ${TAR_PATH} not found in repository. Listing repo root:" && ls -la
+              exit 1
+            fi
+          fi
+          echo "tarfile=${TAR_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract project tar.gz and detect project root
+        id: extract
+        run: |
+          TAR_FILE=${{ steps.fetch_tar.outputs.tarfile }}
+          mkdir -p project_extracted
+          tar -xzf "$TAR_FILE" -C project_extracted
+          # detect root (Assets + ProjectSettings)
+          if [ -d project_extracted/Assets ] && [ -d project_extracted/ProjectSettings ]; then
+            echo "project_root=project_extracted" >> "$GITHUB_OUTPUT"
+          else
+            SUBDIR=$(find project_extracted -maxdepth 3 -type d -name Assets -printf '%h\n' | head -n 1 || true)
+            if [ -n "$SUBDIR" ]; then
+              echo "project_root=$SUBDIR" >> "$GITHUB_OUTPUT"
+            else
+              echo "Could not find Assets/ and ProjectSettings/ in tarball." && ls -la project_extracted && exit 1
+            fi
+          fi
+
+      - name: Prepare fallback BuildScript if missing
+        run: |
+          PROJECT_DIR=${{ steps.extract.outputs.project_root }}
+          echo "Project dir: $PROJECT_DIR"
+          if [ ! -f "$PROJECT_DIR/Assets/Editor/BuildScript.cs" ]; then
+            mkdir -p "$PROJECT_DIR/Assets/Editor"
+            cat > "$PROJECT_DIR/Assets/Editor/BuildScript.cs" <<'EOF'
+using UnityEditor;
+using UnityEditor.Build.Reporting;
+using System.IO;
+
+public static class BuildScript
+{
+    public static void Build()
+    {
+        string buildFolder = "BuildWebGL";
+        if (!Directory.Exists(buildFolder)) Directory.CreateDirectory(buildFolder);
+
+        string[] scenes = new string[0];
+        var editorScenes = EditorBuildSettings.scenes;
+        if (editorScenes != null && editorScenes.Length > 0)
+        {
+            var list = new System.Collections.Generic.List<string>();
+            foreach (var s in editorScenes) if (s.enabled) list.Add(s.path);
+            scenes = list.ToArray();
+        }
+
+        if (scenes.Length == 0)
+        {
+            var found = Directory.GetFiles("Assets", "*.unity", SearchOption.AllDirectories);
+            if (found.Length > 0) scenes = new string[] { found[0] };
+        }
+
+        BuildPlayerOptions buildPlayerOptions = new BuildPlayerOptions();
+        buildPlayerOptions.scenes = scenes;
+        buildPlayerOptions.locationPathName = Path.Combine(buildFolder, "index.html");
+        buildPlayerOptions.target = BuildTarget.WebGL;
+        buildPlayerOptions.options = BuildOptions.None;
+
+        BuildReport report = BuildPipeline.BuildPlayer(buildPlayerOptions);
+        if (report.summary.result != BuildResult.Succeeded)
+        {
+            throw new System.Exception("Build falhou: " + report.summary.result);
+        }
+    }
+}
+EOF
+          else
+            echo "BuildScript already present; keeping existing script."
+          fi
+
+      - name: Create Unity license file on runner (if secret provided)
+        if: ${{ secrets.UNITY_LICENSE != '' }}
+        run: |
+          printf '%s' "${{ secrets.UNITY_LICENSE }}" > UnityLicense.ulf
+
+      - name: Run Unity in Docker to build
+        run: |
+          IMAGE="${{ env.UNITY_IMAGE }}"
+          echo "Using Unity image: $IMAGE"
+          docker pull "$IMAGE"
+          PROJECT_DIR=${{ steps.extract.outputs.project_root }}
+          HOST_PROJECT_PATH="$PWD/$PROJECT_DIR"
+          echo "Host project path: $HOST_PROJECT_PATH"
+          LICENSE_MOUNT=""
+          LICENSE_ARG=""
+          if [ -f UnityLicense.ulf ]; then
+            LICENSE_MOUNT="-v $PWD/UnityLicense.ulf:/tmp/UnityLicense.ulf:ro"
+            LICENSE_ARG="-manualLicenseFile /tmp/UnityLicense.ulf"
+            echo "Unity license file found: will try manual activation"
+          fi
+          docker run --rm -v "$HOST_PROJECT_PATH":/project -w /project $LICENSE_MOUNT "$IMAGE" /bin/bash -c "set -e; if [ -n \"$LICENSE_ARG\" ]; then /opt/unity/Editor/Unity -batchmode -nographics -quit $LICENSE_ARG || true; fi; /opt/unity/Editor/Unity -batchmode -nographics -silent-crashes -projectPath /project -buildTarget ${BUILD_TARGET} -executeMethod BuildScript.Build -logFile /project/build.log -quit"
+
+      - name: Collect and move build to artifact folder
+        run: |
+          PROJECT_DIR=${{ steps.extract.outputs.project_root }}
+          mkdir -p artifact
+          if [ -d "$PROJECT_DIR/BuildWebGL" ]; then
+            cp -r "$PROJECT_DIR/BuildWebGL" artifact/
+          elif [ -d "$PROJECT_DIR/build" ]; then
+            cp -r "$PROJECT_DIR/build" artifact/
+          else
+            echo "No BuildWebGL or build folder found in project root."
+          fi
+          ls -la artifact || true
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: mega-stars-webgl
+          path: artifact/
+
+      - name: Show build log (last 200 lines)
+        if: always()
+        run: |
+          PROJECT_DIR=${{ steps.extract.outputs.project_root }}
+          echo "--- Build log (tail -n 200) ---"
+          if [ -f "$PROJECT_DIR/build.log" ]; then tail -n 200 "$PROJECT_DIR/build.log"; else echo "No build.log found in project root"; fi
